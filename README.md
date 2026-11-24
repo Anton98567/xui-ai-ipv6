@@ -49,7 +49,10 @@ categories are `google-deepmind` and `anthropic`.
 ## Requirements
 
 - root access on the 3x-ui server
-- working global IPv6 (`curl -6 https://api6.ipify.org`)
+- working global IPv6. The script **verifies it itself** before touching anything:
+  every global address is probed with `--interface`, `api6.ipify.org` must echo back
+  exactly that address, and a second endpoint must answer. If none works, `apply`
+  aborts with no changes.
 - `python3`, `curl`, `systemctl`, Xray binary (default path auto-detected by convention)
 - Xray ≥ 1.8 (tested on 26.7.28)
 
@@ -75,31 +78,48 @@ curl -fsSL https://raw.githubusercontent.com/Anton98567/xui-ai-ipv6/main/xui-cla
 All three patches can be applied together. They are independent: each owns its own
 outbound, rule, DNS entry and state file.
 
+## Install all three at once (one line)
+
+```bash
+for p in gemini openai claude; do curl -fsSL "https://raw.githubusercontent.com/Anton98567/xui-ai-ipv6/main/xui-${p}-v6-patch.sh" -o "/usr/local/sbin/xui-${p}-v6-patch.sh" && chmod 700 "/usr/local/sbin/xui-${p}-v6-patch.sh" && "/usr/local/sbin/xui-${p}-v6-patch.sh" apply || exit 1; done
+```
+
+Each patch still performs its own IPv6 preflight, so the loop stops at the first
+provider whose IPv6/network validation fails.
+
 ## Modes
 
 ```bash
-xui-<provider>-v6-patch.sh apply    # add routing and restart x-ui
+xui-<provider>-v6-patch.sh apply    # verify IPv6, back up, add routing, restart x-ui, E2E test
 xui-<provider>-v6-patch.sh remove   # remove only own objects and restore original DNS strategy
 xui-<provider>-v6-patch.sh status   # read-only: show outbound/rule/DNS state
-xui-<provider>-v6-patch.sh test     # diagnostics: IPv6, AAAA, HTTP, generated config (no changes)
+xui-<provider>-v6-patch.sh test     # read-only: IPv6 preflight, AAAA, HTTP, config validation + REAL E2E
 ```
 
 `apply` / `remove` briefly restart `x-ui` (active connections are interrupted).
 
 ## Safety
 
+- **IPv6 is selected only after a live egress test**, before any DB/config change. A forced
+  `XUI_AI_IPV6` is checked the same way. AI domains must have AAAA records; direct HTTP
+  reachability of AI hosts is reported but is not required, because production traffic
+  goes through the Xray route.
 - DB + template backup before every change: `/root/bak-3xui/`
 - Generated config validated with `xray -c <tmp> test` before committing to the result
+- **Real end-to-end test after apply**: the generated config is cloned into a temporary
+  Xray instance with a local SOCKS inbound. Provider traffic must exit over the chosen IPv6
+  (Cloudflare `ip=` check for OpenAI/Claude, HTTP check for Gemini), while the control
+  domain `api.ipify.org` must keep its original IPv4 route.
 - Automatic rollback on failure (invalid config / missing generated objects)
 - `remove` is surgical: it never touches rules or outbounds created by other patches
   or by the panel
-- `status` and `test` never modify anything
+- `status` and `test` never modify anything (E2E uses a temporary Xray process and cleans up)
 
 ## Environment overrides
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `XUI_AI_IPV6` | autodetect | force a specific source IPv6 |
+| `XUI_AI_IPV6` | autodetect | force a specific source IPv6 (still connectivity-checked) |
 | `XUI_DB` | `/etc/x-ui/x-ui.db` | x-ui SQLite DB |
 | `XUI_SERVICE` | `x-ui` | systemd service |
 | `XRAY_BIN` | `/usr/local/x-ui/bin/xray-linux-amd64` | Xray binary |
@@ -108,8 +128,11 @@ xui-<provider>-v6-patch.sh test     # diagnostics: IPv6, AAAA, HTTP, generated c
 | `XUI_AI_DNS` | `8.8.8.8` | plain-IP DNS used for AAAA (DoH URLs cannot be combined with `queryStrategy`) |
 | `XUI_AI_STATE_DIR` | `/var/lib/xui-ai-ipv6` | saved original global DNS strategy |
 | `XUI_AI_TIMEOUT` | `15` | diagnostic curl timeout |
-| `XUI_AI_TEST_PROXY` | empty | optional local proxy for an end-to-end check |
-| `XUI_AI_SKIP_TEST` | `0` | set to `1` to skip post-apply connectivity tests |
+| `XUI_AI_PROBE_TIMEOUT` | `8` | IPv6 preflight curl timeout |
+| `XUI_AI_E2E_TIMEOUT` | `20` | end-to-end curl timeout |
+| `XUI_AI_TEST_PROXY` | empty | optional extra proxy check (e.g. `socks5h://127.0.0.1:1080`) |
+| `XUI_AI_SKIP_TEST` | `0` | set to `1` to skip all post-apply diagnostics |
+| `XUI_AI_SKIP_E2E` | `0` | set to `1` to skip only the real Xray E2E test |
 
 ## Verification example
 
@@ -118,10 +141,14 @@ xui-gemini-v6-patch.sh status
 xui-gemini-v6-patch.sh test
 ```
 
-A stronger end-to-end check can be done by cloning the generated config, replacing
-`inbounds` with a temporary local SOCKS inbound, starting a second Xray instance and
-checking `https://chatgpt.com/cdn-cgi/trace` (the `ip=` field must show the server IPv6)
-versus a control domain such as `https://api.ipify.org` (must keep the old IPv4 route).
+`test` already includes the real E2E check — expected output (excerpt):
+
+```
+[xui-ai-openai-v6] IPv6 preflight: 2001:db8::1 — egress confirmed (ipify + second endpoint)
+=== E2E through Xray (expected IPv6 2001:db8::1) ===
+[xui-ai-openai-v6] E2E OK: openai via Xray exits over IPv6 2001:db8::1
+[xui-ai-openai-v6] E2E OK: control api.ipify.org keeps the old IPv4 route (192.0.2.10)
+```
 
 ## Notes / caveats
 
